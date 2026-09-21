@@ -1,4 +1,5 @@
 import asyncio, math, random, time, json, threading
+from typing import Optional
 from collections import defaultdict, deque
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,6 +13,14 @@ DEVICE_TYPES = ["CNC", "RobotArm", "Conveyor", "AGV", "InjectionMolding", "QCSta
 STATUSES = ["RUNNING", "IDLE", "FAULT", "OFFLINE"]
 ACTIVE_CLIENTS: list[WebSocket] = []
 SIMULATOR_RUNNING = True
+MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+# 班次按本地时间划分: 早班 00:00-08:00 / 中班 08:00-16:00 / 晚班 16:00-24:00
+SHIFTS = [
+    {"id": "morning", "name": "早班", "start_hour": 0, "end_hour": 8},
+    {"id": "middle", "name": "中班", "start_hour": 8, "end_hour": 16},
+    {"id": "night", "name": "晚班", "start_hour": 16, "end_hour": 24},
+]
 
 class DeviceState:
     def __init__(self, did: int, dtype: str, x: float, y: float, z: float):
@@ -42,6 +51,28 @@ devices = {i: DeviceState(i, random.choice(DEVICE_TYPES),
 
 production_log = []
 anomaly_log = []
+
+# ---- 班次运行态 ----
+def today_str(now=None):
+    return time.strftime("%Y-%m-%d", time.localtime(now or time.time()))
+
+def current_shift_id(now=None):
+    now = now or time.time()
+    hour = time.localtime(now).tm_hour
+    for s in SHIFTS:
+        if s["start_hour"] <= hour < s["end_hour"]:
+            return s["id"]
+    return SHIFTS[-1]["id"]
+
+def new_shift_records():
+    return {s["id"]: {"id": s["id"], "name": s["name"],
+                      "production": 0, "running_seconds": 0} for s in SHIFTS}
+
+shift_date = today_str()
+shift_records = new_shift_records()
+line_status = "IDLE"
+last_production_total = sum(d.production_count for d in devices.values())
+running_streak_start: dict[str, float] = {}  # shift_id -> 本段连续运行起始时间戳
 
 class AnomalyRules:
     def __init__(self):
@@ -74,51 +105,104 @@ class AnomalyRules:
 
 rules_engine = AnomalyRules()
 
+def tick(now=None):
+    """推进一个仿真周期(约1秒)，并更新当班的产线运行态与产量。"""
+    global shift_date, shift_records, line_status, last_production_total, running_streak_start
+    now = now or time.time()
+
+    # 跨天重置各班次统计
+    today = today_str(now)
+    if today != shift_date:
+        shift_date = today
+        shift_records = new_shift_records()
+        running_streak_start = {}
+
+    for dev in devices.values():
+        drift = 0.1 * math.sin(now * 0.5 + dev.id)
+        noise = random.gauss(0, 0.3)
+        dev.temperature = max(25, min(65, dev.temperature + drift + noise))
+
+        v_drift = 0.02 * math.sin(now * 0.3 + dev.id * 0.7)
+        dev.vibration = max(0, min(3, dev.vibration + v_drift + random.gauss(0, 0.05)))
+
+        dev.pressure = max(0.5, min(2, dev.pressure + random.gauss(0, 0.02)))
+
+        if random.random() < 0.015:
+            dev.status = "FAULT"
+            dev.fault_count += 1
+        elif random.random() < 0.03 and dev.status == "FAULT":
+            dev.status = "RUNNING"
+
+        if dev.status == "RUNNING":
+            if random.random() < 0.4:
+                dev.production_count += 1
+            dev.uptime += 1
+
+        triggers = rules_engine.check(dev)
+        if triggers and dev.status != "FAULT" and random.random() < 0.3:
+            dev.status = "FAULT"
+
+    total = sum(d.production_count for d in devices.values())
+    delta = total - last_production_total
+    last_production_total = total
+
+    statuses = {d.status for d in devices.values()}
+    if "RUNNING" in statuses:
+        line_status = "RUNNING"
+    elif "FAULT" in statuses:
+        line_status = "FAULT"
+    elif all(s == "OFFLINE" for s in statuses):
+        line_status = "OFFLINE"
+    else:
+        line_status = "IDLE"
+
+    sid = current_shift_id(now)
+    # 产量按设备计数差值入账到当班；差值为权威值，重连/重复订阅都不会重复累加
+    if delta > 0:
+        shift_records[sid]["production"] += delta
+
+    # 连续运行时长：按班次记录当前一段不间断 RUNNING 的起点
+    if line_status == "RUNNING":
+        if sid not in running_streak_start:
+            running_streak_start[sid] = now
+        shift_records[sid]["running_seconds"] = int(max(0, now - running_streak_start[sid]))
+        # 跨班时本段运行在上一班结束、在当班从头计时
+        for old_sid in list(running_streak_start.keys()):
+            if old_sid != sid:
+                del running_streak_start[old_sid]
+    else:
+        # 停止运行后时长冻结在上一段；故障恢复后重新从 0 计
+        running_streak_start.pop(sid, None)
+
+    production_log.append({"timestamp": now, "count": total})
+
+    payload = {
+        "devices": [d.to_dict() for d in devices.values()],
+        "production": shift_records[sid]["production"],
+        "line_status": line_status,
+        "current_shift": sid,
+        "shift_date": today,
+        "shifts": [shift_records[s["id"]] for s in SHIFTS],
+        "anomalies": anomaly_log[-5:] if anomaly_log else [],
+        "oee": calculate_oee()
+    }
+    return json.dumps(payload)
+
+
 def simulate():
     while SIMULATOR_RUNNING:
-        for dev in devices.values():
-            drift = 0.1 * math.sin(time.time() * 0.5 + dev.id)
-            noise = random.gauss(0, 0.3)
-            dev.temperature = max(25, min(65, dev.temperature + drift + noise))
-
-            v_drift = 0.02 * math.sin(time.time() * 0.3 + dev.id * 0.7)
-            dev.vibration = max(0, min(3, dev.vibration + v_drift + random.gauss(0, 0.05)))
-
-            dev.pressure = max(0.5, min(2, dev.pressure + random.gauss(0, 0.02)))
-
-            if random.random() < 0.015:
-                dev.status = "FAULT"
-                dev.fault_count += 1
-            elif random.random() < 0.03 and dev.status == "FAULT":
-                dev.status = "RUNNING"
-
-            if dev.status == "RUNNING":
-                if random.random() < 0.4:
-                    dev.production_count += 1
-                dev.uptime += 1
-
-            triggers = rules_engine.check(dev)
-            if triggers and dev.status != "FAULT" and random.random() < 0.3:
-                dev.status = "FAULT"
-
-        production_log.append({"timestamp": time.time(), "count": sum(d.production_count for d in devices.values())})
-
         try:
-            payload = {
-                "devices": [d.to_dict() for d in devices.values()],
-                "production": sum(d.production_count for d in devices.values()),
-                "anomalies": anomaly_log[-5:] if anomaly_log else [],
-                "oee": calculate_oee()
-            }
-            msg = json.dumps(payload)
-        except:
+            msg = tick()
+        except Exception:
+            time.sleep(1)
             continue
 
         dead = []
         for ws in ACTIVE_CLIENTS:
             try:
-                asyncio.run_coroutine_threadsafe(ws.send_text(msg), asyncio.get_event_loop())
-            except:
+                assert MAIN_LOOP is not None
+                asyncio.run_coroutine_threadsafe(ws.send_text(msg), MAIN_LOOP)
+            except Exception:
                 dead.append(ws)
         for ws in dead:
             if ws in ACTIVE_CLIENTS:
@@ -151,6 +235,8 @@ class OEEAnalysis(BaseModel):
 
 @app.on_event("startup")
 async def startup():
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_event_loop()
     t = threading.Thread(target=simulate, daemon=True)
     t.start()
 
@@ -168,6 +254,16 @@ def get_oee():
 @app.get("/api/production")
 def get_production():
     return {"log": production_log[-60:]}
+
+
+@app.get("/api/line")
+def get_line():
+    return {
+        "date": shift_date,
+        "current_shift": current_shift_id(),
+        "line_status": line_status,
+        "shifts": [shift_records[s["id"]] for s in SHIFTS],
+    }
 
 
 @app.websocket("/ws")

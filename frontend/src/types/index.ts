@@ -15,11 +15,40 @@ export interface OEEItem {
   availability: number; performance: number; quality: number
 }
 
+export type ShiftId = 'morning' | 'middle' | 'night'
+
+export interface ShiftRecord {
+  id: ShiftId
+  name: string
+  production: number
+  running_seconds: number
+}
+
 export interface FactoryData {
   devices: Device[]
   production: number
   anomalies: Anomaly[]
   oee: OEEItem[]
+  line_status?: string
+  current_shift?: ShiftId
+  shift_date?: string
+  shifts?: ShiftRecord[]
+}
+
+export const SHIFTS: { id: ShiftId; name: string }[] = [
+  { id: 'morning', name: '早班' },
+  { id: 'middle', name: '中班' },
+  { id: 'night', name: '晚班' },
+]
+
+export const SHIFT_NAMES: Record<string, string> = {
+  morning: '早班 (00:00-08:00)',
+  middle: '中班 (08:00-16:00)',
+  night: '晚班 (16:00-24:00)',
+}
+
+export const STATUS_TEXT: Record<string, string> = {
+  RUNNING: '运行中', IDLE: '待机', FAULT: '故障', OFFLINE: '离线',
 }
 
 export const DEVICE_COLORS: Record<string, string> = {
