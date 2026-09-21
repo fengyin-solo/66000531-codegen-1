@@ -5,9 +5,11 @@
       <div class="status-row">
         <span class="ws-dot" :class="{on: store.connected}"></span>
         <span>{{ store.connected ? '实时连接中' : '连接断开' }}</span>
-        <span class="prod-count">今日产量: {{ store.data?.production || 0 }}</span>
+        <span v-if="store.stale" class="stale-tag">数据已过期</span>
+        <span class="prod-count" :class="{stale: store.stale}">今日产量: {{ store.currentShift?.production ?? 0 }}</span>
       </div>
     </header>
+    <ShiftBar />
     <div class="main-grid">
       <div class="scene-col"><FactoryScene /></div>
       <div class="panel-col">
@@ -26,6 +28,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted } from 'vue'
 import FactoryScene from './components/FactoryScene.vue'
+import ShiftBar from './components/ShiftBar.vue'
 import DeviceList from './components/DeviceList.vue'
 import AnomalyList from './components/AnomalyList.vue'
 import OEEChart from './components/OEEChart.vue'
@@ -47,6 +50,8 @@ body{font-family:system-ui,sans-serif;background:#0a1628;color:#e0e6ed;overflow-
 .ws-dot{width:10px;height:10px;border-radius:50%;background:#ef4444}
 .ws-dot.on{background:#22c55e;box-shadow:0 0 8px #22c55e}
 .prod-count{color:#fbbf24;font-weight:600}
+.prod-count.stale{opacity:.5}
+.stale-tag{font-size:11px;color:#fbbf24;background:#fbbf2415;border:1px solid #fbbf2455;padding:1px 8px;border-radius:8px}
 .main-grid{display:grid;grid-template-columns:1fr 360px;gap:12px;padding:12px 24px;min-height:55vh}
 .scene-col{background:#0d1b2a;border-radius:12px;border:1px solid #1e3a5f;overflow:hidden}
 .panel-col{display:flex;flex-direction:column;gap:12px;overflow-y:auto;max-height:55vh}

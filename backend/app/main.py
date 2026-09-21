@@ -12,6 +12,18 @@ DEVICE_TYPES = ["CNC", "RobotArm", "Conveyor", "AGV", "InjectionMolding", "QCSta
 STATUSES = ["RUNNING", "IDLE", "FAULT", "OFFLINE"]
 ACTIVE_CLIENTS: list[WebSocket] = []
 SIMULATOR_RUNNING = True
+MAIN_LOOP = None  # 启动时捕获主事件循环，仿真线程通过它向客户端推送
+
+# 班次定义：夜班 00-08 / 早班 08-16 / 中班 16-24
+SHIFT_DEFS = [
+    {"id": "night", "name": "夜班", "start": 0, "end": 8},
+    {"id": "morning", "name": "早班", "start": 8, "end": 16},
+    {"id": "evening", "name": "中班", "start": 16, "end": 24},
+]
+# (日期, 班次id) -> {"production": int, "run_seconds": int, "status": str}
+# 产量在仿真循环里按增量单点累加，客户端重连/重复进入只读累计值，不会重复计数
+shift_stats: dict = {}
+last_total_production = 0
 
 class DeviceState:
     def __init__(self, did: int, dtype: str, x: float, y: float, z: float):
@@ -74,6 +86,71 @@ class AnomalyRules:
 
 rules_engine = AnomalyRules()
 
+def current_shift_id(now: float) -> str:
+    hour = time.localtime(now).tm_hour
+    for s in SHIFT_DEFS:
+        if s["start"] <= hour < s["end"]:
+            return s["id"]
+    return SHIFT_DEFS[0]["id"]
+
+
+def line_status() -> str:
+    """产线级状态：过半设备故障才算产线故障，过半在跑即为运行中。"""
+    sts = [d.status for d in devices.values()]
+    n = len(sts)
+    faulted = sum(1 for s in sts if s == "FAULT")
+    running = sum(1 for s in sts if s == "RUNNING")
+    if faulted >= n / 2:
+        return "FAULT"
+    if running >= n / 2:
+        return "RUNNING"
+    if all(s == "OFFLINE" for s in sts):
+        return "OFFLINE"
+    return "IDLE"
+
+
+def update_shift_stats(now: float, total_production: int):
+    """每个仿真周期调用一次：把本周期产量增量计入当前班次，并刷新连续运行时长。"""
+    global last_total_production
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
+    st = shift_stats.setdefault((today, current_shift_id(now)),
+                                {"production": 0, "run_seconds": 0, "status": "IDLE"})
+    delta = max(0, total_production - last_total_production)
+    last_total_production = total_production
+    st["production"] += delta
+    status = line_status()
+    st["status"] = status
+    st["run_seconds"] = st["run_seconds"] + 1 if status == "RUNNING" else 0
+    # 只保留今天的班次数据
+    for key in [k for k in shift_stats if k[0] != today]:
+        del shift_stats[key]
+
+
+def build_shifts(now: float):
+    lt = time.localtime(now)
+    today = time.strftime("%Y-%m-%d", lt)
+    hour = lt.tm_hour
+    active_id = current_shift_id(now)
+    shifts = []
+    for s in SHIFT_DEFS:
+        stats = shift_stats.get((today, s["id"]))
+        if s["id"] == active_id:
+            status = stats["status"] if stats else "IDLE"
+        elif hour >= s["end"]:
+            status = "ENDED"
+        else:
+            status = "PENDING"
+        shifts.append({
+            "id": s["id"], "name": s["name"],
+            "window": f'{s["start"]:02d}:00-{s["end"]:02d}:00',
+            "active": s["id"] == active_id,
+            "status": status,
+            "production": stats["production"] if stats else 0,
+            "run_seconds": stats["run_seconds"] if stats else 0,
+        })
+    return shifts
+
+
 def simulate():
     while SIMULATOR_RUNNING:
         for dev in devices.values():
@@ -101,14 +178,19 @@ def simulate():
             if triggers and dev.status != "FAULT" and random.random() < 0.3:
                 dev.status = "FAULT"
 
-        production_log.append({"timestamp": time.time(), "count": sum(d.production_count for d in devices.values())})
+        now = time.time()
+        total_production = sum(d.production_count for d in devices.values())
+        update_shift_stats(now, total_production)
+        production_log.append({"timestamp": now, "count": total_production})
 
         try:
             payload = {
                 "devices": [d.to_dict() for d in devices.values()],
-                "production": sum(d.production_count for d in devices.values()),
+                "production": total_production,
                 "anomalies": anomaly_log[-5:] if anomaly_log else [],
-                "oee": calculate_oee()
+                "oee": calculate_oee(),
+                "current_shift": current_shift_id(now),
+                "shifts": build_shifts(now)
             }
             msg = json.dumps(payload)
         except:
@@ -117,7 +199,7 @@ def simulate():
         dead = []
         for ws in ACTIVE_CLIENTS:
             try:
-                asyncio.run_coroutine_threadsafe(ws.send_text(msg), asyncio.get_event_loop())
+                asyncio.run_coroutine_threadsafe(ws.send_text(msg), MAIN_LOOP)
             except:
                 dead.append(ws)
         for ws in dead:
@@ -151,6 +233,8 @@ class OEEAnalysis(BaseModel):
 
 @app.on_event("startup")
 async def startup():
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_running_loop()
     t = threading.Thread(target=simulate, daemon=True)
     t.start()
 
@@ -168,6 +252,12 @@ def get_oee():
 @app.get("/api/production")
 def get_production():
     return {"log": production_log[-60:]}
+
+
+@app.get("/api/shifts")
+def get_shifts():
+    now = time.time()
+    return {"current_shift": current_shift_id(now), "shifts": build_shifts(now)}
 
 
 @app.websocket("/ws")
